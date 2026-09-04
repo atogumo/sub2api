@@ -706,7 +706,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			if len(failedAccountIDs) == 0 {
 				if legacyCompact && errors.Is(err, service.ErrNoAvailableCompactAccounts) {
 					markOpsRoutingCapacityLimitedIfNoAvailable(c, err)
-					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "compact_not_supported", "No available accounts support /responses/compact", streamStarted)
+					recordNoAvailableAccountsReasonForOps(c, noAvailableAccountsReasonNoCompact)
+					h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "compact_not_supported", noCompactAccountsClientMessage, streamStarted)
 					return
 				}
 				if imageSizeRouted {
@@ -2290,7 +2291,8 @@ func (h *OpenAIGatewayHandler) handleOpenAIProfitVetoExhausted(
 ) {
 	reqLog.Warn("openai.profit_veto_attempts_exhausted", zap.Int("profit_veto_count", vetoCount))
 	markOpsRoutingCapacityLimited(c)
-	h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", profitVetoExhaustedMessage, streamStarted)
+	recordNoAvailableAccountsReasonForOps(c, profitVetoExhaustedReason)
+	h.handleStreamingAwareError(c, http.StatusServiceUnavailable, "api_error", noAvailableAccountsClientMessage, streamStarted)
 }
 
 func (h *OpenAIGatewayHandler) acquireResponsesAccountSlot(
@@ -2327,7 +2329,8 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 	}
 	if selection == nil || selection.Account == nil {
 		markOpsRoutingCapacityLimited(c)
-		writeError(http.StatusServiceUnavailable, "api_error", "", "No available accounts")
+		recordNoAvailableAccountsReasonForOps(c, noAvailableAccountsReasonNoAccount)
+		writeError(http.StatusServiceUnavailable, "api_error", "", noAvailableAccountsClientMessage)
 		return nil, openAISlotAcquireFailed
 	}
 
@@ -2357,7 +2360,8 @@ func (h *OpenAIGatewayHandler) acquireOpenAIAccountSlot(
 	}
 	if selection.WaitPlan == nil {
 		markOpsRoutingCapacityLimited(c)
-		writeError(http.StatusServiceUnavailable, "api_error", "", "No available accounts")
+		recordNoAvailableAccountsReasonForOps(c, noAvailableAccountsReasonNoSlot)
+		writeError(http.StatusServiceUnavailable, "api_error", "", noAvailableAccountsClientMessage)
 		return nil, openAISlotAcquireFailed
 	}
 
