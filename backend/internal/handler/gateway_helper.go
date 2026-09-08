@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,25 +53,32 @@ func SetClaudeCodeClientContext(c *gin.Context, body []byte, parsedReq *service.
 	// Fast path：非 Claude CLI UA 直接判定 false，避免热路径二次 JSON 反序列化。
 	if !claudeCodeValidator.ValidateUserAgent(ua) {
 		ctx := service.SetClaudeCodeClient(c.Request.Context(), false)
+		ctx = service.SetClaudeCodeRejectReason(ctx, describeClaudeCodeReject(service.ClaudeCodeRejectUAMismatch, c.Request.URL.Path, ua, nil))
 		c.Request = c.Request.WithContext(ctx)
 		return
 	}
 
 	isClaudeCode := false
+	rejectReason := ""
+	var bodyMap map[string]any
 	if !strings.Contains(c.Request.URL.Path, "messages") {
 		// 与 Validate 行为一致：非 messages 路径 UA 命中即可视为 Claude Code 客户端。
 		isClaudeCode = true
 	} else {
 		// 仅在确认为 Claude CLI 且 messages 路径时再做 body 解析。
-		bodyMap := claudeCodeBodyMapFromParsedRequest(parsedReq)
+		bodyMap = claudeCodeBodyMapFromParsedRequest(parsedReq)
 		if bodyMap == nil && len(body) > 0 {
 			_ = json.Unmarshal(body, &bodyMap)
 		}
-		isClaudeCode = claudeCodeValidator.Validate(c.Request, bodyMap)
+		isClaudeCode, rejectReason = claudeCodeValidator.ValidateWithReason(c.Request, bodyMap)
 	}
 
 	// 更新 request context
 	ctx := service.SetClaudeCodeClient(c.Request.Context(), isClaudeCode)
+	if !isClaudeCode {
+		// 失败原因与请求形态只进运维归因，见 claudeCodeOnlyError。
+		ctx = service.SetClaudeCodeRejectReason(ctx, describeClaudeCodeReject(rejectReason, c.Request.URL.Path, ua, bodyMap))
+	}
 
 	// 仅在确认为 Claude Code 客户端时提取版本号写入 context
 	if isClaudeCode {
@@ -82,12 +90,49 @@ func SetClaudeCodeClientContext(c *gin.Context, body []byte, parsedReq *service.
 	c.Request = c.Request.WithContext(ctx)
 }
 
+// describeClaudeCodeReject 把校验失败原因和请求形态压成一行摘要，例如
+// "system_prompt_mismatch; path=/v1/messages model=claude-sonnet-4-5 max_tokens=1 stream=false system=absent ua=claude-cli/2.1.260".
+// 只取形态字段，不含任何提示词或消息正文。
+func describeClaudeCodeReject(reason, path, ua string, bodyMap map[string]any) string {
+	model, maxTokens, stream, system := "-", "-", "-", "absent"
+	if bodyMap != nil {
+		if m, ok := bodyMap["model"].(string); ok && m != "" {
+			model = m
+		}
+		switch mt := bodyMap["max_tokens"].(type) {
+		case float64:
+			maxTokens = strconv.Itoa(int(mt))
+		case int:
+			maxTokens = strconv.Itoa(mt)
+		}
+		if s, ok := bodyMap["stream"].(bool); ok {
+			stream = strconv.FormatBool(s)
+		}
+		if sys, ok := bodyMap["system"]; ok && sys != nil {
+			switch v := sys.(type) {
+			case string:
+				system = "string"
+			case []any:
+				system = "array:" + strconv.Itoa(len(v))
+			default:
+				system = "present"
+			}
+		}
+	}
+	if len(ua) > 80 {
+		ua = ua[:80]
+	}
+	return fmt.Sprintf("%s; path=%s model=%s max_tokens=%s stream=%s system=%s ua=%s",
+		reason, path, model, maxTokens, stream, system, ua)
+}
+
 func claudeCodeBodyMapFromParsedRequest(parsedReq *service.ParsedRequest) map[string]any {
 	if parsedReq == nil {
 		return nil
 	}
 	bodyMap := map[string]any{
-		"model": parsedReq.Model,
+		"model":  parsedReq.Model,
+		"stream": parsedReq.Stream,
 	}
 	// 探测识别（max_tokens=1）需要看到该字段，复用已解析请求时一并带上。
 	if parsedReq.MaxTokens > 0 {
