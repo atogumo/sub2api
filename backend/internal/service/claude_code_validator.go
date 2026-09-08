@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -82,78 +83,118 @@ func NewClaudeCodeValidator() *ClaudeCodeValidator {
 //	        - anthropic-version header 检查
 //	        - metadata.user_id 格式验证
 func (v *ClaudeCodeValidator) Validate(r *http.Request, body map[string]any) bool {
+	ok, _ := v.ValidateWithReason(r, body)
+	return ok
+}
+
+// Claude Code 校验失败原因。稳定的机器可读标识，供运维日志归因；
+// 与对外响应无关，客户端永远看不到它们。
+const (
+	ClaudeCodeRejectUAMismatch            = "ua_mismatch"
+	ClaudeCodeRejectSystemPromptMismatch  = "system_prompt_mismatch"
+	ClaudeCodeRejectMissingXApp           = "missing_header:x-app"
+	ClaudeCodeRejectMissingBeta           = "missing_header:anthropic-beta"
+	ClaudeCodeRejectMissingVersion        = "missing_header:anthropic-version"
+	ClaudeCodeRejectMissingBody           = "missing_body"
+	ClaudeCodeRejectMissingMetadataUserID = "missing_metadata_user_id"
+	ClaudeCodeRejectInvalidMetadataUserID = "invalid_metadata_user_id"
+)
+
+// ValidateWithReason 与 Validate 判定一致，并在未通过时返回失败的规则名。
+// 通过时 reason 为空字符串。
+func (v *ClaudeCodeValidator) ValidateWithReason(r *http.Request, body map[string]any) (bool, string) {
 	// Step 1: User-Agent 检查
 	ua := r.Header.Get("User-Agent")
 	if !claudeCodeUAPattern.MatchString(ua) {
-		return false
+		return false, ClaudeCodeRejectUAMismatch
 	}
 
 	// Step 2: 非 messages 路径只要 UA 匹配就通过
 	path := r.URL.Path
 	if !strings.Contains(path, "messages") {
-		return true
+		return true, ""
 	}
 
 	// count_tokens 是 Claude Code 官方辅助请求，通常不携带完整 messages system prompt。
 	if isMessagesCountTokensPath(path) {
-		return true
+		return true, ""
 	}
 
 	// Step 3: 检查 max_tokens=1 + haiku 探测请求绕过
 	// 这类请求用于 Claude Code 验证 API 连通性，不携带 system prompt
 	if isMaxTokensOneHaiku, ok := IsMaxTokensOneHaikuRequestFromContext(r.Context()); ok && isMaxTokensOneHaiku {
-		return true // 绕过 system prompt 检查，UA 已在 Step 1 验证
+		return true, "" // 绕过 system prompt 检查，UA 已在 Step 1 验证
 	}
 	// 探测请求并不总是打到 haiku：CLI 切换模型、刷新上下文用量时会向当前模型发
 	// max_tokens=1 的轻量请求，同样不携带 system。UA 已过 Step 1，且 1 个输出 token
 	// 对滥用者没有价值，故按请求体放行，不再限定模型名。
 	if isMaxTokensOneBody(body) {
-		return true
+		return true, ""
 	}
 
 	// Step 4: messages 路径，进行严格验证
 
 	// 4.1 检查 system prompt 相似度
 	if !v.hasClaudeCodeSystemPrompt(body) {
-		return false
+		return false, ClaudeCodeRejectSystemPromptMismatch
 	}
 
 	// 4.2 检查必需的 headers（值不为空即可）
-	xApp := r.Header.Get("X-App")
-	if xApp == "" {
-		return false
+	if r.Header.Get("X-App") == "" {
+		return false, ClaudeCodeRejectMissingXApp
 	}
-
-	anthropicBeta := r.Header.Get("anthropic-beta")
-	if anthropicBeta == "" {
-		return false
+	if r.Header.Get("anthropic-beta") == "" {
+		return false, ClaudeCodeRejectMissingBeta
 	}
-
-	anthropicVersion := r.Header.Get("anthropic-version")
-	if anthropicVersion == "" {
-		return false
+	if r.Header.Get("anthropic-version") == "" {
+		return false, ClaudeCodeRejectMissingVersion
 	}
 
 	// 4.3 验证 metadata.user_id
 	if body == nil {
-		return false
+		return false, ClaudeCodeRejectMissingBody
 	}
 
 	metadata, ok := body["metadata"].(map[string]any)
 	if !ok {
-		return false
+		return false, ClaudeCodeRejectMissingMetadataUserID
 	}
 
 	userID, ok := metadata["user_id"].(string)
 	if !ok || userID == "" {
-		return false
+		return false, ClaudeCodeRejectMissingMetadataUserID
 	}
 
 	if ParseMetadataUserID(userID) == nil {
-		return false
+		return false, ClaudeCodeRejectInvalidMetadataUserID
 	}
 
-	return true
+	return true, ""
+}
+
+// SetClaudeCodeRejectReason 记录校验失败原因与请求形态摘要，供运维日志归因。
+func SetClaudeCodeRejectReason(ctx context.Context, detail string) context.Context {
+	return context.WithValue(ctx, ctxkey.ClaudeCodeRejectReason, detail)
+}
+
+// ClaudeCodeRejectReason 读取 SetClaudeCodeRejectReason 记录的摘要，未记录时为空。
+func ClaudeCodeRejectReason(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(ctxkey.ClaudeCodeRejectReason).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// claudeCodeOnlyError 在 ErrClaudeCodeOnly 上附带校验失败摘要。errors.Is 语义不变；
+// 摘要只会通过运维侧的错误记录呈现，网关对外仍返回中性文案。
+func claudeCodeOnlyError(ctx context.Context) error {
+	if detail := ClaudeCodeRejectReason(ctx); detail != "" {
+		return fmt.Errorf("%w (client check failed: %s)", ErrClaudeCodeOnly, detail)
+	}
+	return ErrClaudeCodeOnly
 }
 
 func isMessagesCountTokensPath(path string) bool {
