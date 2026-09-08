@@ -598,3 +598,60 @@ func TestClaudeCodeValidator_MaxTokensOneProbeStillRequiresClaudeCodeUA(t *testi
 
 	require.False(t, validator.Validate(req, map[string]any{"model": "claude-sonnet-4-5", "max_tokens": 1}))
 }
+
+func TestClaudeCodeValidator_ValidateWithReason_NamesTheFailingRule(t *testing.T) {
+	validator := NewClaudeCodeValidator()
+	newReq := func(ua string, headers map[string]string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/messages", nil)
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		return req
+	}
+	fullHeaders := map[string]string{
+		"X-App":             "claude-code",
+		"anthropic-beta":    "message-batches-2024-09-24",
+		"anthropic-version": "2023-06-01",
+	}
+	validSystem := []any{map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."}}
+
+	cases := []struct {
+		name    string
+		req     *http.Request
+		body    map[string]any
+		wantOK  bool
+		wantWhy string
+	}{
+		{"non cli ua", newReq("curl/8.6.0", fullHeaders), map[string]any{"model": "claude-sonnet-4-5"}, false, ClaudeCodeRejectUAMismatch},
+		{"no system prompt", newReq("claude-cli/2.1.260", fullHeaders), map[string]any{"model": "claude-sonnet-4-5", "max_tokens": 64}, false, ClaudeCodeRejectSystemPromptMismatch},
+		{"missing x-app", newReq("claude-cli/2.1.260", map[string]string{"anthropic-beta": "b", "anthropic-version": "v"}), map[string]any{"model": "m", "system": validSystem}, false, ClaudeCodeRejectMissingXApp},
+		{"missing anthropic-beta", newReq("claude-cli/2.1.260", map[string]string{"X-App": "a", "anthropic-version": "v"}), map[string]any{"model": "m", "system": validSystem}, false, ClaudeCodeRejectMissingBeta},
+		{"missing anthropic-version", newReq("claude-cli/2.1.260", map[string]string{"X-App": "a", "anthropic-beta": "b"}), map[string]any{"model": "m", "system": validSystem}, false, ClaudeCodeRejectMissingVersion},
+		{"missing metadata", newReq("claude-cli/2.1.260", fullHeaders), map[string]any{"model": "m", "system": validSystem}, false, ClaudeCodeRejectMissingMetadataUserID},
+		{"invalid metadata", newReq("claude-cli/2.1.260", fullHeaders), map[string]any{"model": "m", "system": validSystem, "metadata": map[string]any{"user_id": "not-a-claude-code-id"}}, false, ClaudeCodeRejectInvalidMetadataUserID},
+		{"valid", newReq("claude-cli/2.1.260", fullHeaders), map[string]any{"model": "m", "system": validSystem, "metadata": map[string]any{"user_id": "user_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_account__session_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, why := validator.ValidateWithReason(tc.req, tc.body)
+			require.Equal(t, tc.wantOK, ok)
+			require.Equal(t, tc.wantWhy, why)
+			// Validate must agree with ValidateWithReason.
+			require.Equal(t, tc.wantOK, validator.Validate(tc.req, tc.body))
+		})
+	}
+}
+
+func TestClaudeCodeOnlyError_CarriesRejectDetailButStaysIs(t *testing.T) {
+	ctx := SetClaudeCodeRejectReason(context.Background(), "system_prompt_mismatch; path=/v1/messages model=claude-sonnet-4-5 max_tokens=64 stream=false system=absent ua=claude-cli/2.1.260")
+	err := claudeCodeOnlyError(ctx)
+	require.ErrorIs(t, err, ErrClaudeCodeOnly)
+	require.Contains(t, err.Error(), "client check failed: system_prompt_mismatch")
+	require.Contains(t, err.Error(), "max_tokens=64")
+
+	require.Same(t, ErrClaudeCodeOnly, claudeCodeOnlyError(context.Background()))
+	require.Equal(t, "", ClaudeCodeRejectReason(context.Background()))
+}
