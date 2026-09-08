@@ -515,6 +515,13 @@ func isOpsNoAvailableAccountError(err error) bool {
 	if errors.Is(err, service.ErrNoAvailableAccounts) || errors.Is(err, service.ErrNoAvailableCompactAccounts) {
 		return true
 	}
+	// A claude_code_only rejection used to reach clients and ops as
+	// "No available accounts: this group only allows Claude Code clients", so the
+	// channel monitor already files it under the pool; keep that attribution now
+	// that the wire body is neutral, otherwise the rejection reason disappears.
+	if errors.Is(err, service.ErrClaudeCodeOnly) {
+		return true
+	}
 	return isOpsNoAvailableAccountMessage(err.Error())
 }
 
