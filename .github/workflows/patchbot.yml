@@ -1,0 +1,181 @@
+name: patchbot
+
+# 轮询上游 tag → 把 patches 分支重放到新 tag 上 → 编译/单测门禁 → 出镜像到 GHCR。
+# 只在默认分支上按计划运行（GitHub 限制），所以这个文件所在的分支必须是仓库默认分支。
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "指定上游 tag（留空 = 最新 v* tag）"
+        required: false
+        default: ""
+      force:
+        description: "已构建过也强制重做"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+concurrency:
+  group: patchbot
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/Wei-Shaw/sub2api.git
+  PATCH_BRANCH: patches
+  IMAGE: ghcr.io/${{ github.repository }}
+  GIT_AUTHOR_NAME: atogumo
+  GIT_AUTHOR_EMAIL: 41533924+atogumo@users.noreply.github.com
+  GIT_COMMITTER_NAME: atogumo
+  GIT_COMMITTER_EMAIL: 41533924+atogumo@users.noreply.github.com
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.PATCH_BRANCH }}
+
+      - name: Fetch upstream tags and main
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream main "+refs/tags/*:refs/tags/*"
+
+      - name: Resolve target tag
+        id: target
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+            git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || { echo "::error::tag $TAG not found upstream"; exit 1; }
+          else
+            TAG=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # 已处理过的 tag 会在 origin 留下 patched/<tag> 标记
+          if [ "${{ inputs.force }}" != "true" ] && git ls-remote --exit-code --tags origin "patched/$TAG" >/dev/null 2>&1; then
+            echo "already built $TAG"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # 补丁基线 = patches 与 upstream/main 的分叉点；tag 必须在基线之后，否则是回退
+          BASE=$(git merge-base "origin/$PATCH_BRANCH" upstream/main)
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          if ! git merge-base --is-ancestor "$BASE" "$TAG"; then
+            echo "tag $TAG predates patch base $BASE; nothing to do"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "will rebase $(git rev-list --count "$BASE".."origin/$PATCH_BRANCH") patch commit(s) from $BASE onto $TAG"
+
+      - name: Rebase patches onto target tag
+        if: steps.target.outputs.skip == 'false'
+        id: rebase
+        run: |
+          set -euo pipefail
+          git checkout -q -B "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
+          if ! git rebase --onto "${{ steps.target.outputs.tag }}" "${{ steps.target.outputs.base }}"; then
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
+            git rebase --abort
+            echo "conflicts<<EOF" >> "$GITHUB_OUTPUT"; cat /tmp/conflicts.txt >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "::error::rebase onto ${{ steps.target.outputs.tag }} conflicted"
+            exit 1
+          fi
+          echo "patched_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git log --oneline "${{ steps.target.outputs.tag }}"..HEAD
+
+      - name: Setup Go
+        if: steps.target.outputs.skip == 'false'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Gate — build and handler unit tests
+        if: steps.target.outputs.skip == 'false'
+        working-directory: backend
+        run: |
+          go build ./...
+          go test -tags=unit ./internal/handler/
+
+      - name: Login to GHCR
+        if: steps.target.outputs.skip == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup buildx
+        if: steps.target.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        if: steps.target.outputs.skip == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.target.outputs.tag }}
+            ${{ env.IMAGE }}:latest
+          build-args: |
+            VERSION=${{ steps.target.outputs.tag }}-patched
+            BUILD_TYPE=source
+            COMMIT=${{ steps.rebase.outputs.patched_sha }}
+            DATE=${{ github.run_started_at }}
+            GOPROXY=https://proxy.golang.org,direct
+            GOSUMDB=sum.golang.org
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.rebase.outputs.patched_sha }}
+            org.opencontainers.image.version=${{ steps.target.outputs.tag }}-patched
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish patches branch and patched/<tag> marker
+        if: steps.target.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          git push --force-with-lease="$PATCH_BRANCH:origin/$PATCH_BRANCH" origin "HEAD:refs/heads/$PATCH_BRANCH"
+          git tag -f "patched/${{ steps.target.outputs.tag }}" HEAD
+          git push -f origin "refs/tags/patched/${{ steps.target.outputs.tag }}"
+          {
+            echo "## patchbot: ${{ steps.target.outputs.tag }}"
+            echo
+            echo "- image: \`${IMAGE}:${{ steps.target.outputs.tag }}\` (also \`:latest\`)"
+            echo "- patches head: \`${{ steps.rebase.outputs.patched_sha }}\`"
+            echo "- patch commits:"
+            git log --format='  - %h %s' "${{ steps.target.outputs.tag }}"..HEAD
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open issue on failure
+        if: failure() && steps.target.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+          CONFLICTS: ${{ steps.rebase.outputs.conflicts }}
+        run: |
+          set -euo pipefail
+          gh label create patchbot --color D93F0B --description "patchbot needs a human" --force >/dev/null
+          TITLE="patchbot: $TAG needs manual attention"
+          if [ -n "$(gh issue list --label patchbot --state open --search "in:title \"$TAG\"" --json number --jq '.[0].number')" ]; then
+            echo "issue already open"; exit 0
+          fi
+          if [ -n "$CONFLICTS" ]; then
+            BODY=$(printf 'Rebase of `%s` onto upstream `%s` conflicted in:\n\n```\n%s\n```\n\nFix locally: `git fetch upstream --tags && git rebase --onto %s $(git merge-base %s upstream/main) %s`, resolve, then force-push `%s`. The next scheduled run retries automatically.\n\nRun: %s/%s/actions/runs/%s' "$PATCH_BRANCH" "$TAG" "$CONFLICTS" "$TAG" "$PATCH_BRANCH" "$PATCH_BRANCH" "$PATCH_BRANCH" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          else
+            BODY=$(printf 'Rebase onto `%s` applied cleanly but the build gate or image build failed. See the run log.\n\nRun: %s/%s/actions/runs/%s' "$TAG" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          fi
+          gh issue create --title "$TITLE" --label patchbot --body "$BODY"
