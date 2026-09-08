@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -515,4 +516,44 @@ func TestSetClaudeCodeClientContext_ParsedRequestProbeWithoutSystemPrompt(t *tes
 	c2.Request.Header.Set("User-Agent", "claude-cli/2.1.260 (external, cli)")
 	SetClaudeCodeClientContext(c2, nil, &service.ParsedRequest{Model: "claude-sonnet-4-5", MaxTokens: 64})
 	require.False(t, service.IsClaudeCodeClient(c2.Request.Context()))
+}
+
+func TestSetClaudeCodeClientContext_RecordsRejectReasonForOps(t *testing.T) {
+	t.Run("non cli ua", func(t *testing.T) {
+		c, _ := newHelperTestContext(http.MethodPost, "/v1/messages")
+		c.Request.Header.Set("User-Agent", "curl/8.6.0")
+
+		SetClaudeCodeClientContext(c, validClaudeCodeBodyJSON(), nil)
+		detail := service.ClaudeCodeRejectReason(c.Request.Context())
+		require.Contains(t, detail, service.ClaudeCodeRejectUAMismatch)
+		require.Contains(t, detail, "ua=curl/8.6.0")
+	})
+
+	t.Run("cli request without system prompt reports shape", func(t *testing.T) {
+		c, _ := newHelperTestContext(http.MethodPost, "/v1/messages")
+		c.Request.Header.Set("User-Agent", "claude-cli/2.1.260 (external, cli)")
+
+		SetClaudeCodeClientContext(c, []byte(`{"model":"claude-sonnet-4-5","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"hi"}]}`), nil)
+		require.False(t, service.IsClaudeCodeClient(c.Request.Context()))
+		detail := service.ClaudeCodeRejectReason(c.Request.Context())
+		require.True(t, strings.HasPrefix(detail, service.ClaudeCodeRejectSystemPromptMismatch+";"), detail)
+		require.Contains(t, detail, "model=claude-sonnet-4-5")
+		require.Contains(t, detail, "max_tokens=64")
+		require.Contains(t, detail, "stream=false")
+		require.Contains(t, detail, "system=absent")
+		// The summary describes shape only; message bodies never leak into it.
+		require.NotContains(t, detail, "hi")
+	})
+
+	t.Run("accepted request records nothing", func(t *testing.T) {
+		c, _ := newHelperTestContext(http.MethodPost, "/v1/messages")
+		c.Request.Header.Set("User-Agent", "claude-cli/1.0.1")
+		c.Request.Header.Set("X-App", "claude-code")
+		c.Request.Header.Set("anthropic-beta", "message-batches-2024-09-24")
+		c.Request.Header.Set("anthropic-version", "2023-06-01")
+
+		SetClaudeCodeClientContext(c, validClaudeCodeBodyJSON(), nil)
+		require.True(t, service.IsClaudeCodeClient(c.Request.Context()))
+		require.Equal(t, "", service.ClaudeCodeRejectReason(c.Request.Context()))
+	})
 }

@@ -942,7 +942,7 @@ func (s *GatewayService) resolveGatewayGroup(ctx context.Context, groupID *int64
 		}
 
 		if group.FallbackGroupID == nil {
-			return nil, nil, ErrClaudeCodeOnly
+			return nil, nil, claudeCodeOnlyError(ctx)
 		}
 		currentID = *group.FallbackGroupID
 	}
