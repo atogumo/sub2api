@@ -271,12 +271,13 @@ func (v *ClaudeCodeValidator) hasClaudeCodeSystemPrompt(body map[string]any) boo
 }
 
 // claudeCodeSecurityMonitorMarkers 与固定前缀、长度下限共同构成分类器提示词的
-// 判别条件，须全部命中。
+// 判别条件，须全部命中。只保留跨版本稳定的部分：2.1.266 的分类器提示词删去了
+// 「## HARD BLOCK」「## SOFT BLOCK」两个章节，输入说明也不再写成「- `<transcript>`:」
+// （其余章节如 Default Rule / Scope / User Intent Rule / Evaluation Rules 在 2.1.220 中已存在），
+// 而威胁模型、分类流程、输出格式三个章节标题与 <transcript> / <block> 标签在两个版本中都在。
 var claudeCodeSecurityMonitorMarkers = []string{
 	"## Threat Model",
-	"- `<transcript>`:",
-	"## HARD BLOCK",
-	"## SOFT BLOCK",
+	"<transcript>",
 	"## Classification Process",
 	"## Output Format",
 	"<block>yes</block>",
