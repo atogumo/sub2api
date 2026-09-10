@@ -122,8 +122,14 @@ func describeClaudeCodeReject(reason, path, ua string, bodyMap map[string]any) s
 	if len(ua) > 80 {
 		ua = ua[:80]
 	}
-	return fmt.Sprintf("%s; path=%s model=%s max_tokens=%s stream=%s system=%s ua=%s",
+	summary := fmt.Sprintf("%s; path=%s model=%s max_tokens=%s stream=%s system=%s ua=%s",
 		reason, path, model, maxTokens, stream, system, ua)
+	// system prompt 不匹配时再逐块说明差在哪（长度、分类器前缀、缺失标记、模板块开头），
+	// 否则只知道"不匹配"，无法区分是提示词改版还是别的客户端。
+	if reason == service.ClaudeCodeRejectSystemPromptMismatch && bodyMap != nil {
+		summary += " blocks=" + service.DescribeClaudeCodeSystemBlocks(bodyMap["system"])
+	}
+	return summary
 }
 
 func claudeCodeBodyMapFromParsedRequest(parsedReq *service.ParsedRequest) map[string]any {
