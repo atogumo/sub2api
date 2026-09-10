@@ -406,6 +406,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 				UpstreamURL: safeUpstreamURL(upstreamReq.URL.String()),
 			})
 		}
+		// 排障诊断（默认关闭，见 gateway_debug_upstream.go）：记录非流式请求与 4xx/5xx 往返的形态摘要。
+		if shouldLogUpstreamDebug(wireBody, resp) {
+			logUpstreamDebug(account, upstreamReq, wireBody, resp)
+		}
 
 		// 优先检测thinking block签名错误（400）并重试一次
 		if resp.StatusCode == 400 {
