@@ -255,6 +255,16 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		}
 	}
 
+	// 实验（默认关闭）：已确认的 Claude Code 客户端在网关模式下 metadata.user_id 的 account 段为空，
+	// 与所用 OAuth token 不一致；补齐为所选账号的 uuid，device_id 与 session_id 不动。见 fillEmptyMetadataAccountUUID。
+	if claudeCodeMetadataAccountFillEnabled && account.IsOAuth() && isClaudeCode {
+		if next, changed := fillEmptyMetadataAccountUUID(body, parsed, account); changed {
+			if err := replaceBody(next); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// 客户端 dateline 归一化：仅对 Anthropic OAuth/SetupToken 账号生效。
 	// 抹除 "Today's date is …" 语句里可能被注入的隐写指纹（4 种撇号 × 2 种日期
 	// 分隔符），还原为 ASCII 撇号 + "-" 分隔符。运行在 mimicry 分支之外，
