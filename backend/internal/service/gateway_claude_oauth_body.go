@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -1274,4 +1275,35 @@ func systemHasBillingAttributionBlock(body []byte) bool {
 		return true
 	})
 	return found
+}
+
+// claudeCodeMetadataAccountFillEnabled 控制"为已确认的 Claude Code 客户端补齐 metadata.user_id
+// 的 account 段"这一实验性改写。网关模式下的 Claude Code 没有登录任何账号，account 段为空；
+// 请求却携带账号池里某个账号的 OAuth token。对普通对话上游容忍这种不一致，但 auto 模式的
+// 安全分类器请求经此转发会被上游以 429 拒绝并把账号推进冷却（见 #1926）。实验用环境变量
+// CLAUDE_CODE_FILL_METADATA_ACCOUNT=true 开启，默认关闭，不改变现有行为。
+var claudeCodeMetadataAccountFillEnabled = strings.EqualFold(strings.TrimSpace(os.Getenv("CLAUDE_CODE_FILL_METADATA_ACCOUNT")), "true")
+
+// fillEmptyMetadataAccountUUID 在 metadata.user_id 的 account 段为空时填入所选 OAuth 账号的
+// uuid；device_id 与 session_id 原样保留，格式（JSON / legacy）跟随客户端原值。
+// 任一前提不满足（非 OAuth 账号、无 metadata、account 段非空、账号缺少 account_uuid）都原样返回。
+func fillEmptyMetadataAccountUUID(body []byte, parsed *ParsedRequest, account *Account) ([]byte, bool) {
+	if parsed == nil || account == nil || !account.IsOAuth() || len(body) == 0 {
+		return body, false
+	}
+	p := ParseMetadataUserID(parsed.MetadataUserID)
+	if p == nil || p.AccountUUID != "" {
+		return body, false
+	}
+	accountUUID := strings.TrimSpace(account.GetExtraString("account_uuid"))
+	if accountUUID == "" {
+		return body, false
+	}
+	var next string
+	if p.IsNewFormat {
+		next = FormatMetadataUserID(p.DeviceID, accountUUID, p.SessionID, NewMetadataFormatMinVersion)
+	} else {
+		next = "user_" + p.DeviceID + "_account_" + accountUUID + "_session_" + p.SessionID
+	}
+	return setJSONValueBytes(body, "metadata.user_id", next)
 }
