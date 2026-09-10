@@ -297,12 +297,12 @@ func TestClaudeCodeValidator_SecurityMonitorWithoutBillingBlock(t *testing.T) {
 			wantAccept: false,
 		},
 		{
-			// 篡改后的长提示词（marker 缺失）即便带上会话上下文块也不得放行。
+			// 篡改后的长提示词（跨版本稳定 marker 缺失）即便带上会话上下文块也不得放行。
 			name:    "tampered classifier with session context entry",
 			headers: validHeaders,
 			body: func() map[string]any {
 				body := validBody(strings.ReplaceAll(
-					string(monitorPrompt), "## HARD BLOCK", "## ALTERED BLOCK"))
+					string(monitorPrompt), "## Classification Process", "## ALTERED PROCESS"))
 				system, ok := body["system"].([]any)
 				require.True(t, ok)
 				body["system"] = append(system, map[string]any{
@@ -312,6 +312,19 @@ func TestClaudeCodeValidator_SecurityMonitorWithoutBillingBlock(t *testing.T) {
 				return body
 			}(),
 			wantAccept: false,
+		},
+		{
+			// 2.1.266 删去了 HARD BLOCK / SOFT BLOCK 两个章节，输入说明也不再用反引号包住
+			// <transcript>（标签本身仍在）。把真实样本改成这个形态后仍须放行，否则新版本的
+			// 分类器请求会全部被拦。
+			name:    "real classifier prompt without HARD/SOFT BLOCK sections (2.1.266 shape)",
+			headers: validHeaders,
+			body: validBody(strings.NewReplacer(
+				"## HARD BLOCK", "## X",
+				"## SOFT BLOCK", "## Y",
+				"- `<transcript>`:", "- <transcript>:",
+			).Replace(string(monitorPrompt))),
+			wantAccept: true,
 		},
 	}
 
@@ -654,4 +667,65 @@ func TestClaudeCodeOnlyError_CarriesRejectDetailButStaysIs(t *testing.T) {
 
 	require.Same(t, ErrClaudeCodeOnly, claudeCodeOnlyError(context.Background()))
 	require.Equal(t, "", ClaudeCodeRejectReason(context.Background()))
+}
+
+// Claude Code 2.1.266 的 auto 模式分类器提示词删去了 HARD BLOCK / SOFT BLOCK 两个章节，
+// 输入说明不再写成 "- `<transcript>`:"（Default Rule / Scope / User Intent Rule / Evaluation Rules
+// 等章节在 2.1.220 中已存在）。这里按其章节结构合成一份 ≥10k 的提示词，验证识别规则只依赖跨版本稳定的标记。
+func syntheticClassifierPrompt266(dropSection string) string {
+	var b strings.Builder
+	_, _ = b.WriteString(claudeCodeSecurityMonitorPromptPrefix)
+	_, _ = b.WriteString("\n\n## Context\n\nThe agent you are monitoring is an autonomous coding agent with shell access.\n\n")
+	sections := []string{
+		"## Threat Model\n\nBlock actions that cross a security boundary or are destructive.\n\n",
+		"## Input\n\nThe transcript is provided inside <transcript> tags; the latest action is last.\n\n",
+		"## Default Rule\n\nAllow unless a rule below applies.\n\n",
+		"## Scope\n\nOnly the latest action is under review.\n\n",
+		"## User Intent Rule\n\nExplicit user confirmation can clear a block.\n\n",
+		"## Evaluation Rules\n\n- Judge the action by its full effect.\n\n",
+		"## Classification Process\n\n1. Identify the action. 2. Match rules. 3. Decide.\n\n",
+		"## Output Format\n\nRespond with <block>yes</block> or <block>no</block>.\n",
+	}
+	for _, s := range sections {
+		if dropSection != "" && strings.HasPrefix(s, dropSection) {
+			continue
+		}
+		_, _ = b.WriteString(s)
+	}
+	for b.Len() < claudeCodeSecurityMonitorPromptMinLen+500 {
+		_, _ = b.WriteString("- Example rule text that pads the prompt to a realistic length for the length gate.\n")
+	}
+	return b.String()
+}
+
+func TestClaudeCodeValidator_SecurityMonitor266WithoutBillingBlock(t *testing.T) {
+	validator := NewClaudeCodeValidator()
+	newReq := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/messages", nil)
+		req.Header.Set("User-Agent", "claude-cli/2.1.266 (external, cli)")
+		req.Header.Set("X-App", "cli")
+		req.Header.Set("anthropic-beta", "claude-code-20250219")
+		req.Header.Set("anthropic-version", "2023-06-01")
+		return req
+	}
+	// 2.1.266 的分类器请求：system[0] 为分类器提示词，system[1] 为待判定动作的说明块，
+	// 客户端关闭计费归因块（CLAUDE_CODE_ATTRIBUTION_HEADER）时没有第三块。
+	body := func(prompt string) map[string]any {
+		return map[string]any{
+			"model":      "claude-sonnet-5",
+			"max_tokens": 64,
+			"system": []any{
+				map[string]any{"type": "text", "text": prompt},
+				map[string]any{"type": "text", "text": "Bash: mkdir demo_dir"},
+			},
+			"metadata": map[string]any{"user_id": claudeCodeMetadataUserIDJSON},
+		}
+	}
+
+	require.True(t, validator.Validate(newReq(), body(syntheticClassifierPrompt266(""))),
+		"2.1.266 classifier prompt (no HARD/SOFT BLOCK sections) must be recognised")
+	require.False(t, validator.Validate(newReq(), body(syntheticClassifierPrompt266("## Classification Process"))),
+		"a prompt missing a stable section marker must still be rejected")
+	require.False(t, validator.Validate(newReq(), body(strings.TrimPrefix(syntheticClassifierPrompt266(""), "You are a "))),
+		"the fixed prefix is still required")
 }
