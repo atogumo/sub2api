@@ -271,17 +271,20 @@ func (v *ClaudeCodeValidator) hasClaudeCodeSystemPrompt(body map[string]any) boo
 }
 
 // claudeCodeSecurityMonitorMarkers 与固定前缀、长度下限共同构成分类器提示词的
-// 判别条件，须全部命中。只保留跨版本稳定的部分：2.1.266 的分类器提示词删去了
-// 「## HARD BLOCK」「## SOFT BLOCK」两个章节，输入说明也不再写成「- `<transcript>`:」
-// （其余章节如 Default Rule / Scope / User Intent Rule / Evaluation Rules 在 2.1.220 中已存在），
-// 而威胁模型、分类流程、输出格式三个章节标题与 <transcript> / <block> 标签在两个版本中都在。
+// 判别条件，须全部命中。只保留跨版本稳定的部分：
+//   - 2.1.266 删去了「## HARD BLOCK」「## SOFT BLOCK」两个章节，输入说明也不再写成
+//     「- `<transcript>`:」（Default Rule / Scope / User Intent Rule / Evaluation Rules 等章节
+//     在 2.1.220 中已存在）；
+//   - 2.1.267 起分类器有服务端灰度的"严重度模式"：把模板末尾的「## Output Format」整段
+//     换成 <severity>N</severity> 输出，<block>yes</block> / <block>no</block> 随之消失，
+//     同一版本的客户端会因灰度而两种形态并存。
+//
+// 威胁模型、分类流程、输出格式三个章节标题与 <transcript> 标签在上述所有形态中都在。
 var claudeCodeSecurityMonitorMarkers = []string{
 	"## Threat Model",
 	"<transcript>",
 	"## Classification Process",
 	"## Output Format",
-	"<block>yes</block>",
-	"<block>no</block>",
 }
 
 // isClaudeCodeSecurityMonitorPrompt 识别 Claude Code auto 模式安全监视器分类器请求。
