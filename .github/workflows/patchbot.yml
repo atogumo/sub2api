@@ -68,11 +68,31 @@ jobs:
             echo "already built $TAG"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
-          # 补丁基线 = patches 与 upstream/main 的分叉点；tag 必须在基线之后，否则是回退
-          BASE=$(git merge-base "origin/$PATCH_BRANCH" upstream/main)
+          # 分叉点只用来判断回退：tag 必须在 patches 与 upstream/main 的分叉点之后
+          FORK=$(git merge-base "origin/$PATCH_BRANCH" upstream/main)
+          if ! git merge-base --is-ancestor "$FORK" "$TAG"; then
+            echo "tag $TAG predates fork point $FORK; nothing to do"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # 补丁基线 = 我们第一个补丁提交的父提交，而不是分叉点。上游撤回过发布
+          # （v0.2.6 的 tag 被删、其提交从 main 消失）时分叉点会退到更早，重放范围就会
+          # 带上上游已撤回的提交：轻则把撤回代码悄悄夹带进镜像，重则在下一个 tag 上冲突。
+          FIRST=$(git rev-list --reverse --no-merges --author="$GIT_AUTHOR_EMAIL" "$FORK..origin/$PATCH_BRANCH" | head -1)
+          if [ -z "$FIRST" ]; then
+            echo "no patch commits by $GIT_AUTHOR_EMAIL on $PATCH_BRANCH; nothing to do"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          BASE=$(git rev-parse "$FIRST^")
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
-          if ! git merge-base --is-ancestor "$BASE" "$TAG"; then
-            echo "tag $TAG predates patch base $BASE; nothing to do"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+
+          # 基线之上只允许我们自己的提交；有别人的提交说明 patches 被手工弄脏了，不自动处理
+          FOREIGN=$(git log --no-merges --format='%ae %h %an %s' "$BASE..origin/$PATCH_BRANCH" | awk -v me="$GIT_AUTHOR_EMAIL" '$1 != me { $1=""; sub(/^ /,""); print }')
+          if [ -n "$FOREIGN" ]; then
+            printf '::error::foreign commits above the patch base on %s:\n%s\n' "$PATCH_BRANCH" "$FOREIGN"; exit 1
+          fi
+          DROPPED=$(git rev-list --count --no-merges "$FORK..$BASE")
+          if [ "$DROPPED" != "0" ]; then
+            echo "dropping $DROPPED withdrawn upstream commit(s) between fork point and patch base:"
+            git log --no-merges --format='  - %h %an %s' "$FORK..$BASE"
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "will rebase $(git rev-list --count "$BASE".."origin/$PATCH_BRANCH") patch commit(s) from $BASE onto $TAG"
@@ -174,7 +194,7 @@ jobs:
             echo "issue already open"; exit 0
           fi
           if [ -n "$CONFLICTS" ]; then
-            BODY=$(printf 'Rebase of `%s` onto upstream `%s` conflicted in:\n\n```\n%s\n```\n\nFix locally: `git fetch upstream --tags && git rebase --onto %s $(git merge-base %s upstream/main) %s`, resolve, then force-push `%s`. The next scheduled run retries automatically.\n\nRun: %s/%s/actions/runs/%s' "$PATCH_BRANCH" "$TAG" "$CONFLICTS" "$TAG" "$PATCH_BRANCH" "$PATCH_BRANCH" "$PATCH_BRANCH" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+            BODY=$(printf 'Rebase of `%s` onto upstream `%s` conflicted in:\n\n```\n%s\n```\n\nFix locally: `git fetch upstream --tags && git rebase --onto %s <parent of your first patch commit> %s`, resolve, then force-push `%s`. The next scheduled run retries automatically.\n\nRun: %s/%s/actions/runs/%s' "$PATCH_BRANCH" "$TAG" "$CONFLICTS" "$TAG" "$PATCH_BRANCH" "$PATCH_BRANCH" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
           else
             BODY=$(printf 'Rebase onto `%s` applied cleanly but the build gate or image build failed. See the run log.\n\nRun: %s/%s/actions/runs/%s' "$TAG" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
           fi
