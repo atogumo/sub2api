@@ -17,8 +17,11 @@ upstream tag vX.Y.Z ──rebase --onto──> patches (vX.Y.Z + 补丁) ──g
 | `ghcr.io/atogumo/sub2api:<tag>` | 对应上游 tag 的打补丁镜像；`:latest` 指向最近一次成功 |
 | `fix/*` 分支 | 只用于向上游提 PR，与流水线无关 |
 
-补丁基线不用记录：`merge-base(patches, upstream/main)` 就是当前基线，rebase 用 `--onto <tag> <基线>` 只重放补丁提交。
-上游 tag 早于基线时（回退）自动跳过。
+补丁基线不用记录：基线 = `patches` 上第一个 atogumo 提交的父提交，rebase 用 `--onto <tag> <基线>` 只重放我们的补丁。
+不用 `merge-base(patches, upstream/main)` 当基线：上游撤回过发布（2026-09-18 的 v0.2.6 被删 tag、提交从 main 消失）时，
+分叉点会退到更早，重放范围就会夹带上游已撤回的提交，v0.2.7-patched 因此悄悄带上了被撤回的 Codex ticket 功能，
+到 v0.2.8 又与上游新代码冲突。现在基线之上出现非 atogumo 提交时工作流直接报错，不自动处理。
+上游 tag 早于分叉点时（回退）自动跳过。
 
 ## 首次启用（一次性）
 
@@ -52,7 +55,9 @@ docker compose pull sub2api && docker compose up -d sub2api
 ```bash
 git fetch upstream --tags
 git checkout patches
-git rebase --onto <tag> $(git merge-base patches upstream/main)
+# 基线 = 第一个 atogumo 补丁提交的父提交；先看一眼 upstream/main..patches 里有没有别人的提交混进来
+git log --format='%h %an %s' upstream/main..patches
+git rebase --onto <tag> <第一个 atogumo 提交>^
 # 解决冲突 → git add → git rebase --continue
 cd backend && go build ./... && go test -tags=unit ./internal/handler/
 git push --force-with-lease origin patches
