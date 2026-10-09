@@ -45,6 +45,11 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ env.PATCH_BRANCH }}
+          # GITHUB_TOKEN 不能推送改动 .github/workflows 的提交（需要 workflows 权限，
+          # 它拿不到）。上游一旦在两个 tag 之间改了自己的 CI 文件，变基后的分支就推不上去
+          # （v0.2.15 首次触发）。改用细粒度 PAT：Contents + Workflows 读写，存为仓库
+          # secret PATCHBOT_TOKEN；checkout 会把它留在 remote 凭据里供后面 git push 使用。
+          token: ${{ secrets.PATCHBOT_TOKEN }}
 
       - name: Fetch upstream tags and main
         run: |
