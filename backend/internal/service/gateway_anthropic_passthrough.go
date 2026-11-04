@@ -95,7 +95,7 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 	var resp *http.Response
 	retryStart := time.Now()
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
-		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, input.RequestStream)
+		upstreamCtx, releaseUpstreamCtx := s.anthropicStreamUpstreamContext(ctx, input.RequestStream)
 		upstreamReq, wireBody, err := s.buildUpstreamRequestAnthropicAPIKeyPassthrough(upstreamCtx, c, account, input.Body, token)
 		releaseUpstreamCtx()
 		if err != nil {
@@ -255,7 +255,8 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 	var clientDisconnect bool
 	if input.RequestStream {
 		streamResult, err := s.handleStreamingResponseAnthropicAPIKeyPassthrough(ctx, resp, c, account, input.StartTime, input.RequestModel)
-		if err != nil {
+		// 客户端离开且上游随之取消：请求已服务到断开时刻，按成功路径记录已观测 usage。
+		if err != nil && !s.clientCancelledStream(ctx, streamResult, err) {
 			// 流中断时保留已观测到的 usage 与错误一起返回，避免上游已计量的请求
 			// 完全漏记漏计费（issue #5148）。
 			if partial := partialStreamUsageResult(c, resp, streamResult, input.OriginalModel, input.RequestModel, input.StartTime, err); partial != nil {

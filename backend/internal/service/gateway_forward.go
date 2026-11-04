@@ -421,7 +421,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	retriedRotatedToken := false
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
 		// 构建上游请求（每次重试需要重新构建，因为请求体需要重新读取）
-		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, reqStream)
+		upstreamCtx, releaseUpstreamCtx := s.anthropicStreamUpstreamContext(ctx, reqStream)
 		upstreamReq, wireBody, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 		releaseUpstreamCtx()
 		if err != nil {
@@ -500,7 +500,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 					//    also downgrade tool_use/tool_result blocks to text.
 
 					filteredBody := FilterThinkingBlocksForRetry(body, reqModel)
-					retryCtx, releaseRetryCtx := detachStreamUpstreamContext(ctx, reqStream)
+					retryCtx, releaseRetryCtx := s.anthropicStreamUpstreamContext(ctx, reqStream)
 					retryReq, retryWireBody, buildErr := s.buildUpstreamRequest(retryCtx, c, account, filteredBody, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 					releaseRetryCtx()
 					if buildErr == nil {
@@ -543,7 +543,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 								if looksLikeToolSignatureError(msg2) && time.Since(retryStart) < maxRetryElapsed {
 									logger.LegacyPrintf("service.gateway", "Account %d: signature retry still failing and looks tool-related, retrying with tool blocks downgraded", account.ID)
 									filteredBody2 := FilterSignatureSensitiveBlocksForRetry(body, reqModel)
-									retryCtx2, releaseRetryCtx2 := detachStreamUpstreamContext(ctx, reqStream)
+									retryCtx2, releaseRetryCtx2 := s.anthropicStreamUpstreamContext(ctx, reqStream)
 									retryReq2, retryWireBody2, buildErr2 := s.buildUpstreamRequest(retryCtx2, c, account, filteredBody2, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 									releaseRetryCtx2()
 									if buildErr2 == nil {
@@ -626,7 +626,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 					rectifiedBody, applied := RectifyThinkingBudget(body)
 					if applied && time.Since(retryStart) < maxRetryElapsed {
 						logger.LegacyPrintf("service.gateway", "Account %d: detected budget_tokens constraint error, retrying with rectified budget (budget_tokens=%d, max_tokens=%d)", account.ID, BudgetRectifyBudgetTokens, BudgetRectifyMaxTokens)
-						budgetRetryCtx, releaseBudgetRetryCtx := detachStreamUpstreamContext(ctx, reqStream)
+						budgetRetryCtx, releaseBudgetRetryCtx := s.anthropicStreamUpstreamContext(ctx, reqStream)
 						budgetRetryReq, budgetWireBody, buildErr := s.buildUpstreamRequest(budgetRetryCtx, c, account, rectifiedBody, token, tokenType, reqModel, reqStream, shouldMimicClaudeCode)
 						releaseBudgetRetryCtx()
 						if buildErr == nil {
@@ -867,12 +867,15 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			if errors.As(err, &sseErr) {
 				return nil, s.sseStreamErrorEventFailover(ctx, c, account, resp, sseErr.RawData, reqModel, c.Writer.Size() != writerSizeBeforeStream)
 			}
-			// 流中断（缺失 terminal 事件、读错误、数据间隔超时等）时保留已观测到的
-			// usage 与错误一起返回，handler 在错误处理完成后照常提交 usage 记录。
-			if partial := partialStreamUsageResult(c, resp, streamResult, originalModel, mappedModel, startTime, err); partial != nil {
-				return partial, err
+			// 客户端离开且上游随之取消：请求已服务到断开时刻，按成功路径记录已观测 usage。
+			if !s.clientCancelledStream(ctx, streamResult, err) {
+				// 流中断（缺失 terminal 事件、读错误、数据间隔超时等）时保留已观测到的
+				// usage 与错误一起返回，handler 在错误处理完成后照常提交 usage 记录。
+				if partial := partialStreamUsageResult(c, resp, streamResult, originalModel, mappedModel, startTime, err); partial != nil {
+					return partial, err
+				}
+				return nil, err
 			}
-			return nil, err
 		}
 		usage = streamResult.usage
 		firstTokenMs = streamResult.firstTokenMs
