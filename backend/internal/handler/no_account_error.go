@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -32,6 +33,39 @@ type noAccountErrorClassification struct {
 	ErrType       string
 	Message       string
 	ModelNotFound bool // true when this is a 404 model_not_found classification
+}
+
+// claudeCodeOnlyRejectionMessage is the wire message for a request that a
+// claude_code_only group (without a fallback group) refused because the client
+// is not Claude Code. It matches the 403 the Chat Completions and Responses
+// entrypoints already send for these groups, minus their endpoint hint: the
+// request reaching this point already used /v1/messages.
+const claudeCodeOnlyRejectionMessage = "This group is restricted to Claude Code clients"
+
+// classifyClaudeCodeOnlyRejection answers a claude_code_only rejection with 403
+// permission_error instead of the 503 the no-available-accounts path would send.
+//
+// The scheduler reports the rejection as a selection failure, so it used to go
+// out as 503 "Service temporarily unavailable". That status is wrong on every
+// count: the request can never succeed with the same client, yet 503 is retried
+// by downstream gateways and by every Anthropic SDK, so one misconfigured client
+// produced a burst of identical errors, and its user read it as an outage. 403
+// is not retried and tells the user what to change.
+//
+// The wire message stays neutral; the validator's detail (which check failed,
+// the User-Agent) is recorded for operators only. The request is attributed to
+// local policy, not to the account pool, because no account was unavailable.
+func classifyClaudeCodeOnlyRejection(c *gin.Context, err error) (noAccountErrorClassification, bool) {
+	if !errors.Is(err, service.ErrClaudeCodeOnly) {
+		return noAccountErrorClassification{}, false
+	}
+	service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalPolicyDenied)
+	service.SetOpsUpstreamError(c, 0, err.Error(), "")
+	return noAccountErrorClassification{
+		Status:  http.StatusForbidden,
+		ErrType: "permission_error",
+		Message: claudeCodeOnlyRejectionMessage,
+	}, true
 }
 
 var selectionModelRateLimitedPattern = regexp.MustCompile(`(?:model_rate_limited|rate_limited)=(\d+)`)
