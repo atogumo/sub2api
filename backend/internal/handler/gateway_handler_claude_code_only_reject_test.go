@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,9 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // A non-Claude-Code client on /v1/messages (or count_tokens) in a claude_code_only
@@ -162,6 +166,147 @@ func TestGatewayAnthropicHandlersClaudeCodeOnlyRejection(t *testing.T) {
 			})
 		}
 	}
+}
+
+// The Chat Completions and Responses entry gate only rejects a claude_code_only
+// group without fallback. When the fallback group is itself claude_code_only with
+// no further fallback, account selection rejects the request instead, and that
+// rejection must get the same 403 rather than the no-available-accounts 503.
+func TestGatewayOpenAICompatibleHandlersClaudeCodeOnlyFallbackChainRejection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const (
+		primaryGroupID  = int64(9500)
+		fallbackGroupID = int64(9501)
+		accountID       = int64(9510)
+	)
+
+	endpoints := []struct {
+		name string
+		path string
+		body string
+		call func(*GatewayHandler, *gin.Context)
+	}{
+		{
+			name: "responses", path: "/v1/responses",
+			body: `{"model":"claude-sonnet-4-5","input":"hello","stream":false}`,
+			call: (*GatewayHandler).Responses,
+		},
+		{
+			name: "chat completions", path: "/v1/chat/completions",
+			body: `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}],"stream":false}`,
+			call: (*GatewayHandler).ChatCompletions,
+		},
+	}
+
+	for _, ep := range endpoints {
+		t.Run(ep.name, func(t *testing.T) {
+			fallbackID := fallbackGroupID
+			primary := &service.Group{
+				ID: primaryGroupID, Hydrated: true, Platform: service.PlatformAnthropic,
+				Status: service.StatusActive, ClaudeCodeOnly: true, FallbackGroupID: &fallbackID,
+			}
+			fallback := &service.Group{
+				ID: fallbackGroupID, Hydrated: true, Platform: service.PlatformAnthropic,
+				Status: service.StatusActive, ClaudeCodeOnly: true,
+			}
+			schedulerCache := &groupScopedSchedulerCache{fakeSchedulerCache: &fakeSchedulerCache{accounts: []*service.Account{{
+				ID: accountID, Platform: service.PlatformAnthropic, Type: service.AccountTypeAPIKey,
+				Status: service.StatusActive, Schedulable: true, Concurrency: 1,
+				AccountGroups: []service.AccountGroup{{AccountID: accountID, GroupID: fallbackGroupID}},
+			}}}}
+			gatewayService := service.NewGatewayService(
+				nil, &groupMapRepo{fakeGroupRepo: &fakeGroupRepo{}, groups: map[int64]*service.Group{
+					primaryGroupID:  primary,
+					fallbackGroupID: fallback,
+				}}, nil, nil, nil, nil, nil, nil, nil,
+				service.NewSchedulerSnapshotService(schedulerCache, nil, nil, nil, nil),
+				nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+			)
+			cfg := &config.Config{RunMode: config.RunModeSimple}
+			billingCacheService := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+			t.Cleanup(billingCacheService.Stop)
+			h := &GatewayHandler{
+				gatewayService:      gatewayService,
+				billingCacheService: billingCacheService,
+				concurrencyHelper:   NewConcurrencyHelper(service.NewConcurrencyService(&fakeConcurrencyCache{}), SSEPingFormatClaude, 0),
+				maxAccountSwitches:  1,
+				cfg:                 cfg,
+			}
+
+			primaryGroupIDRef := primaryGroupID
+			apiKey := &service.APIKey{
+				ID: 9520, UserID: 9530, GroupID: &primaryGroupIDRef, Group: primary, Status: service.StatusActive,
+				User: &service.User{ID: 9530, Concurrency: 10, Balance: 100},
+			}
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			ctx := context.WithValue(context.Background(), ctxkey.Group, primary)
+			req := httptest.NewRequest(http.MethodPost, ep.path, bytes.NewBufferString(ep.body)).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/json")
+			c.Request = req
+			c.Set(string(middleware.ContextKeyAPIKey), apiKey)
+			c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: apiKey.UserID, Concurrency: 10})
+
+			ep.call(h, c)
+
+			require.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+			require.Contains(t, recorder.Body.String(), claudeCodeOnlyRejectionMessage)
+			require.Contains(t, recorder.Body.String(), "permission_error")
+			require.NotContains(t, strings.ToLower(recorder.Body.String()), "temporarily unavailable")
+			_, selected := c.Get(opsAccountIDKey)
+			require.False(t, selected)
+		})
+	}
+}
+
+func TestLogClaudeCodeOnlyRejected_WarnsWhenTheClientClaimsToBeClaudeCode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, tc := range []struct {
+		ua    string
+		level zapcore.Level
+		event string
+	}{
+		{ua: "claude-cli/2.1.300 (external, cli)", level: zapcore.WarnLevel, event: "gateway.claude_code_only_rejected_claude_cli"},
+		{ua: "Go-http-client/1.1", level: zapcore.InfoLevel, event: "gateway.claude_code_only_rejected"},
+		{ua: "", level: zapcore.InfoLevel, event: "gateway.claude_code_only_rejected"},
+	} {
+		t.Run(tc.ua, func(t *testing.T) {
+			core, logs := observer.New(zapcore.DebugLevel)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			c.Request.Header.Set("User-Agent", tc.ua)
+			groupID := int64(1)
+
+			logClaudeCodeOnlyRejected(zap.New(core), c, &groupID, service.ErrClaudeCodeOnly)
+
+			entries := logs.All()
+			require.Len(t, entries, 1)
+			require.Equal(t, tc.level, entries[0].Level)
+			require.Equal(t, tc.event, entries[0].Message)
+			require.Equal(t, tc.ua, entries[0].ContextMap()["user_agent"])
+		})
+	}
+	require.NotPanics(t, func() { logClaudeCodeOnlyRejected(nil, nil, nil, service.ErrClaudeCodeOnly) })
+}
+
+// The validator detail is stored in the upstream-message slot so operators can
+// read it, but without an upstream status or upstream events the rejection must
+// still classify as a local policy denial, never as an upstream failure.
+func TestClaudeCodeOnlyRejection_OpsClassificationStaysLocal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	cls, ok := classifyClaudeCodeOnlyRejection(c, fmt.Errorf("%w (client check failed: ua_mismatch)", service.ErrClaudeCodeOnly))
+	require.True(t, ok)
+
+	phase, isBusinessLimited, _, _ := classifyOpsErrorLog(c, cls.ErrType, cls.Message, "", cls.Status)
+	require.NotEqual(t, "upstream", phase)
+	require.NotEqual(t, "routing", phase)
+	require.True(t, isBusinessLimited)
+	require.False(t, hasOpsUpstreamErrorContext(c))
 }
 
 func TestClassifyClaudeCodeOnlyRejection_IgnoresOtherSelectionErrors(t *testing.T) {

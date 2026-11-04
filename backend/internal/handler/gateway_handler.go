@@ -368,7 +368,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					return
 				}
 				if cls, ok := classifyClaudeCodeOnlyRejection(c, err); ok {
-					reqLog.Info("gateway.claude_code_only_rejected", zap.Int64p("group_id", apiKey.GroupID), zap.Error(err))
+					logClaudeCodeOnlyRejected(reqLog, c, apiKey.GroupID, err)
 					h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 					return
 				}
@@ -705,7 +705,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					return
 				}
 				if cls, ok := classifyClaudeCodeOnlyRejection(c, err); ok {
-					reqLog.Info("gateway.claude_code_only_rejected", zap.Int64p("group_id", currentAPIKey.GroupID), zap.Error(err))
+					logClaudeCodeOnlyRejected(reqLog, c, currentAPIKey.GroupID, err)
 					h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 					return
 				}
@@ -2255,7 +2255,7 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 	account, err := h.gatewayService.SelectAccountForModel(c.Request.Context(), apiKey.GroupID, sessionHash, parsedReq.Model)
 	if err != nil {
 		if cls, ok := classifyClaudeCodeOnlyRejection(c, err); ok {
-			reqLog.Info("gateway.claude_code_only_rejected", zap.Int64p("group_id", apiKey.GroupID), zap.Error(err))
+			logClaudeCodeOnlyRejected(reqLog, c, apiKey.GroupID, err)
 			h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
 			return
 		}
