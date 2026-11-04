@@ -367,6 +367,11 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 					reqLog.Info("gateway.account_select_aborted_client_disconnected", zap.Error(err))
 					return
 				}
+				if cls, ok := classifyClaudeCodeOnlyRejection(c, err); ok {
+					reqLog.Info("gateway.claude_code_only_rejected", zap.Int64p("group_id", apiKey.GroupID), zap.Error(err))
+					h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
+					return
+				}
 				if len(fs.FailedAccountIDs) == 0 {
 					cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, service.PlatformGemini)
 					if !cls.ModelNotFound {
@@ -698,6 +703,11 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			if err != nil {
 				if failoverClientGone(c) {
 					reqLog.Info("gateway.account_select_aborted_client_disconnected", zap.Error(err))
+					return
+				}
+				if cls, ok := classifyClaudeCodeOnlyRejection(c, err); ok {
+					reqLog.Info("gateway.claude_code_only_rejected", zap.Int64p("group_id", currentAPIKey.GroupID), zap.Error(err))
+					h.handleStreamingAwareError(c, cls.Status, cls.ErrType, cls.Message, streamStarted)
 					return
 				}
 				if len(fs.FailedAccountIDs) == 0 {
@@ -2270,6 +2280,11 @@ func (h *GatewayHandler) CountTokens(c *gin.Context) {
 	// 选择支持该模型的账号
 	account, err := h.gatewayService.SelectAccountForModel(c.Request.Context(), apiKey.GroupID, sessionHash, parsedReq.Model)
 	if err != nil {
+		if cls, ok := classifyClaudeCodeOnlyRejection(c, err); ok {
+			reqLog.Info("gateway.claude_code_only_rejected", zap.Int64p("group_id", apiKey.GroupID), zap.Error(err))
+			h.errorResponse(c, cls.Status, cls.ErrType, cls.Message)
+			return
+		}
 		reqLog.Warn("gateway.count_tokens_select_account_failed", zap.Error(err))
 		cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, parsedReq.Model, parsedReq.Model, service.PlatformAnthropic)
 		if !cls.ModelNotFound {
