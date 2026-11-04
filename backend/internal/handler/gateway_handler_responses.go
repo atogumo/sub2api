@@ -208,6 +208,13 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 				reqLog.Info("gateway.responses.account_select_aborted_client_disconnected", zap.Error(err))
 				return
 			}
+			// A fallback chain that ends in another claude_code_only group rejects here,
+			// after the entry gate let the request through to its fallback group.
+			if cls, ok := classifyClaudeCodeOnlyRejection(c, err); ok {
+				logClaudeCodeOnlyRejected(reqLog, c, apiKey.GroupID, err)
+				h.responsesErrorResponse(c, cls.Status, cls.ErrType, cls.Message)
+				return
+			}
 			if len(fs.FailedAccountIDs) == 0 {
 				cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, effectiveAPIKeyPlatform(c, apiKey))
 				cls = classifySelectionFailureError(err, cls)
