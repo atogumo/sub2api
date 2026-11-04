@@ -1078,6 +1078,13 @@ type GatewayConfig struct {
 	DownstreamWriteTimeoutSeconds int `mapstructure:"downstream_write_timeout_seconds"`
 	// TextMaxBodySize limits endpoints that cannot carry inline image/video payloads.
 	TextMaxBodySize int64 `mapstructure:"text_max_body_size"`
+	// CancelUpstreamOnClientDisconnect makes an Anthropic /v1/messages stream follow
+	// the client: when the client disconnects, the upstream request is cancelled and
+	// the usage observed so far is recorded. Off by default, which keeps draining the
+	// upstream after a disconnect so the final usage can be billed. Turn it on when
+	// another gateway in front of sub2API bills the end user: that gateway settles
+	// at the disconnect, so drained output is generated, discarded and charged to no one.
+	CancelUpstreamOnClientDisconnect bool `mapstructure:"cancel_upstream_on_client_disconnect"`
 	// 非流式上游响应体读取上限（字节），用于防止无界读取导致内存放大
 	UpstreamResponseReadMaxBytes int64 `mapstructure:"upstream_response_read_max_bytes"`
 	// 上游模型列表响应体读取上限（字节）
@@ -2629,6 +2636,7 @@ func setDefaults() {
 	viper.SetDefault("gateway.request_body_memory_budget_bytes", defaultRequestBodyMemoryBudgetBytes)
 	viper.SetDefault("gateway.request_body_read_timeout_seconds", 120)
 	viper.SetDefault("gateway.downstream_write_timeout_seconds", 120)
+	viper.SetDefault("gateway.cancel_upstream_on_client_disconnect", false)
 	viper.SetDefault("gateway.text_max_body_size", int64(32*1024*1024))
 	viper.SetDefault("gateway.upstream_response_read_max_bytes", DefaultUpstreamResponseReadMaxBytes)
 	viper.SetDefault("gateway.models_list_read_max_bytes", DefaultModelsListReadMaxBytes)

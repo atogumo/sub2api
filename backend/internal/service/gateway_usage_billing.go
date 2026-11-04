@@ -589,6 +589,41 @@ func detachStreamUpstreamContext(ctx context.Context, stream bool) (context.Cont
 	return pkghttputil.DetachUpstreamContext(ctx), func() {}
 }
 
+// anthropicStreamUpstreamContext returns the context for an Anthropic /v1/messages
+// upstream request. A stream is detached from the client by default so it can be
+// drained for billing after a disconnect; with
+// gateway.cancel_upstream_on_client_disconnect it follows the client, so a client
+// that leaves stops the upstream generation too.
+func (s *GatewayService) anthropicStreamUpstreamContext(ctx context.Context, stream bool) (context.Context, context.CancelFunc) {
+	if s.cancelUpstreamOnClientDisconnect() {
+		if ctx == nil {
+			return context.Background(), func() {}
+		}
+		return ctx, func() {}
+	}
+	return detachStreamUpstreamContext(ctx, stream)
+}
+
+func (s *GatewayService) cancelUpstreamOnClientDisconnect() bool {
+	return s != nil && s.cfg != nil && s.cfg.Gateway.CancelUpstreamOnClientDisconnect
+}
+
+// clientCancelledStream reports whether a stream ended only because the client
+// left while gateway.cancel_upstream_on_client_disconnect let the upstream follow
+// it. Such a request was served up to the disconnect: its observed usage belongs
+// on the success path, like a stream the client watched to the end, not in a
+// forward failure. A stream that ended before any usage was observed keeps the
+// error, so no zero-usage record is written.
+func (s *GatewayService) clientCancelledStream(ctx context.Context, streamResult *streamingResult, err error) bool {
+	if err == nil || streamResult == nil || !streamResult.clientDisconnect || !s.cancelUpstreamOnClientDisconnect() {
+		return false
+	}
+	if !streamResult.usage.hasObservedTokens() {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || (ctx != nil && ctx.Err() != nil)
+}
+
 func detachUpstreamContext(ctx context.Context, drainTimeout ...time.Duration) (context.Context, context.CancelFunc) {
 	if ctx == nil {
 		return context.Background(), func() {}
