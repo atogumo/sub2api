@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -66,6 +67,32 @@ func classifyClaudeCodeOnlyRejection(c *gin.Context, err error) (noAccountErrorC
 		ErrType: "permission_error",
 		Message: claudeCodeOnlyRejectionMessage,
 	}, true
+}
+
+// logClaudeCodeOnlyRejected logs a claude_code_only rejection. A rejected client
+// that announces itself as the Claude Code CLI has most likely failed the
+// validator because a new Claude Code release changed its request shape (2.1.266
+// and 2.1.267 did), and its user now sees "restricted to Claude Code clients"
+// while running Claude Code. That case is logged at Warn as an early signal;
+// any other rejected client is an ordinary misconfiguration, logged at Info.
+func logClaudeCodeOnlyRejected(reqLog *zap.Logger, c *gin.Context, groupID *int64, err error) {
+	if reqLog == nil {
+		return
+	}
+	ua := ""
+	if c != nil && c.Request != nil {
+		ua = c.GetHeader("User-Agent")
+	}
+	fields := []zap.Field{zap.Int64p("group_id", groupID), zap.String("user_agent", ua), zap.Error(err)}
+	if isClaudeCLIUserAgent(ua) {
+		reqLog.Warn("gateway.claude_code_only_rejected_claude_cli", fields...)
+		return
+	}
+	reqLog.Info("gateway.claude_code_only_rejected", fields...)
+}
+
+func isClaudeCLIUserAgent(ua string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(ua)), "claude-cli/")
 }
 
 var selectionModelRateLimitedPattern = regexp.MustCompile(`(?:model_rate_limited|rate_limited)=(\d+)`)
